@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'HELP'
+agent-mail — файловая почта для агентов
+
+  send --to NAME [--subject TEXT] [--body FILE] [--reply-to ID]
+  check                  показать неподтверждённые письма
+  done ID                подтвердить получение (ID включает .md)
+  wait [--timeout N]     ждать письмо, по умолчанию 300 секунд
+  ls                     показать известные имена
+
+Тело send: stdin или --body FILE.
+Окружение: MAIL_ROOT (абсолютный путь), AGENT_NAME (уникальное имя).
+Коды выхода: 0 — успех, 1 — таймаут wait, 2 — ошибка аргументов.
+Ошибки файловой системы также возвращают ненулевой код.
+HELP
+}
+
+fail() { printf 'agent-mail: %s\n' "$*" >&2; exit 2; }
+name_ok() {
+  case "$1" in
+    ''|[!a-zA-Z0-9]*|*[!a-zA-Z0-9_.-]*|*..*) return 1 ;;
+  esac
+}
+value_required() {
+  [ "$#" -ge 2 ] && [ -n "$2" ] || fail "нужно значение для $1"
+}
+# YAML-строка в одинарных кавычках; апострофы удваиваются.
+header() {
+  local value="$2" quote="'"
+  value="${value//$quote/$quote$quote}"
+  case "$value" in
+    *$'\n'*|*$'\r'*) fail "перенос строки в $1" ;;
+  esac
+  printf "%s: '%s'\n" "$1" "$value"
+}
+
+cmd="${1:-help}"
+case "$cmd" in help|-h|--help) usage; exit 0 ;; esac
+[ -n "${MAIL_ROOT:-}" ] || fail 'не задан MAIL_ROOT'
+case "$MAIL_ROOT" in /*) ;; *) fail 'MAIL_ROOT должен быть абсолютным путём' ;; esac
+name_ok "${AGENT_NAME:-}" || fail 'некорректный или пустой AGENT_NAME'
+inbox="$MAIL_ROOT/mailbox/$AGENT_NAME"
+shift
+
+list_inbox() {
+  local f
+  for f in "$inbox"/*.md; do
+    [ -f "$f" ] || continue
+    printf -- '----- %s -----\n' "${f##*/}"
+    cat "$f"
+    printf '\n'
+  done
+}
+has_mail() {
+  local f
+  for f in "$inbox"/*.md; do
+    [ ! -f "$f" ] || return 0
+  done
+  return 1
+}
+
+case "$cmd" in
+  send)
+    to='' subject='' body='' reply_to=''
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --to|--subject|--body|--reply-to)
+          value_required "$@"
+          case "$1" in
+            --to) to="$2" ;;
+            --subject) subject="$2" ;;
+            --body) body="$2" ;;
+            --reply-to) reply_to="$2" ;;
+          esac
+          shift 2 ;;
+        *) fail "неизвестный аргумент: $1" ;;
+      esac
+    done
+    name_ok "$to" || fail 'нужен корректный --to NAME'
+    if [ -n "$body" ]; then
+      [ -f "$body" ] && [ -r "$body" ] || fail "не читается файл: $body"
+    else
+      [ ! -t 0 ] || fail 'нужно тело через stdin или --body FILE'
+    fi
+    dest="$MAIL_ROOT/mailbox/$to"
+    mkdir -p "$dest"
+    tmp="$(mktemp "$dest/.msg-XXXXXXXXXXXX")"
+    trap 'rm -f "$tmp"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    {
+      printf -- '---\n'
+      header from "$AGENT_NAME"
+      header to "$to"
+      if [ -n "$subject" ]; then header subject "$subject"; fi
+      if [ -n "$reply_to" ]; then header reply-to "$reply_to"; fi
+      printf -- '---\n\n'
+      if [ -n "$body" ]; then cat "$body"; else cat; fi
+    } > "$tmp"
+    id="${tmp##*/}"
+    id="${id#.}.md"
+    # Публикация целого письма без перезаписи при совпадении ID.
+    ln "$tmp" "$dest/$id"
+    printf 'отправлено: %s\n' "$id"
+    ;;
+  check)
+    [ "$#" -eq 0 ] || fail 'check не принимает аргументы'
+    mkdir -p "$inbox"
+    if has_mail; then list_inbox; else printf 'новых писем нет\n'; fi
+    ;;
+  done)
+    [ "$#" -eq 1 ] || fail 'нужен done ID'
+    name_ok "$1" || fail 'некорректный ID'
+    case "$1" in *.md) ;; *) fail 'ID должен включать .md' ;; esac
+    [ -f "$inbox/$1" ] || fail "нет сообщения: $1"
+    mkdir -p "$inbox/archive"
+    mv "$inbox/$1" "$inbox/archive/$1"
+    printf 'done: %s\n' "$1"
+    ;;
+  wait)
+    timeout=300
+    if [ "$#" -gt 0 ]; then
+      [ "$#" -eq 2 ] && [ "$1" = --timeout ] || fail 'нужен wait [--timeout N]'
+      timeout="$2"
+    fi
+    case "$timeout" in ''|*[!0-9]*) fail 'таймаут — целое число секунд >= 0' ;; esac
+    mkdir -p "$inbox"
+    elapsed=0
+    until has_mail; do
+      if [ "$elapsed" -ge "$timeout" ]; then
+        printf 'agent-mail: таймаут (%s секунд)\n' "$timeout" >&2
+        exit 1
+      fi
+      sleep 1
+      elapsed=$((elapsed + 1))
+    done
+    list_inbox
+    ;;
+  ls)
+    [ "$#" -eq 0 ] || fail 'ls не принимает аргументы'
+    for dir in "$MAIL_ROOT"/mailbox/*/; do
+      [ -d "$dir" ] || continue
+      dir="${dir%/}"
+      printf '%s\n' "${dir##*/}"
+    done
+    ;;
+  *) fail "неизвестная команда: $cmd" ;;
+esac
